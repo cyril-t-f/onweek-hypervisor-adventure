@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.29)
+
+project(hypervisor CXX ASM_MASM)
+
+set(CMAKE_CXX_STANDARD 23)
+
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+find_package(WDK REQUIRED)
+
+file(GLOB_RECURSE C_FILES "${PROJECT_SOURCE_DIR}/sources/*.cc")
+file(GLOB_RECURSE ASM_FILES "${PROJECT_SOURCE_DIR}/sources/*.asm")
+file(GLOB_RECURSE H_FILES "${PROJECT_SOURCE_DIR}/includes/*.h")
+
+wdk_add_driver(hypervisor ${C_FILES} ${ASM_FILES} ${H_FILES}) 
+target_include_directories(hypervisor PRIVATE "${PROJECT_SOURCE_DIR}/sources")
