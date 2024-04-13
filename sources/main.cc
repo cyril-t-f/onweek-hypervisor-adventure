@@ -3,35 +3,33 @@
 #include <intrin.h>
 #include <ntddk.h>
 
-/*
-  TODO: Fix double free in FreeEPTTable
-*/
-
 #define TO_PFN(address) ((address) >> 12)
 #define FROM_PFN(pfn) ((pfn) << 12)
+#define GOTO_ERROR(cond, msg, ...) \
+  if (cond) {                      \
+    DbgPrint(msg, __VA_ARGS__);    \
+    goto error;                    \
+  }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject,
                                 PUNICODE_STRING RegistryPath) {
   InitializeMJFunctions(DriverObject);
-
-  if (!NT_SUCCESS(InitializeDevices(DriverObject))) {
-    DbgPrint("[-] Failed to initialize devices\n");
-    return STATUS_UNSUCCESSFUL;
-  }
   DriverObject->DriverUnload = DriverUnload;
 
-  if (!InitializeVirtualMachines()) {
-    DbgPrint("[-] Failed to initialize virtual machines\n");
-    return STATUS_UNSUCCESSFUL;
-  }
+  GOTO_ERROR(!NT_SUCCESS(InitializeDevices(DriverObject)),
+             "[-] Failed to initialize devices\n");
 
-  if (!InitializeEPTP(EPT_INITIAL_N_PAGES)) {
-    DbgPrint("[-] Failed to initialize EPT tables\n");
-    return STATUS_UNSUCCESSFUL;
-  }
+  GOTO_ERROR(!InitializeVirtualMachines(),
+             "[-] Failed to initialize virtual machines\n");
+
+  GOTO_ERROR(!InitializeEPTP(EPT_INITIAL_N_PAGES),
+             "[-] Failed to initialize EPT tables\n");
 
   DbgPrint("[+] Driver finished initializing\n");
   return STATUS_SUCCESS;
+
+error:
+  return STATUS_UNSUCCESSFUL;
 }
 
 extern "C" void DriverUnload(PDRIVER_OBJECT DriverObject) {
@@ -66,13 +64,17 @@ void FreeEPTP(void) {
 
   if (eptp->pfn) {
     pa.QuadPart = FROM_PFN(eptp->pfn);
-    pml4 = (PEPTTableEntry)MmGetVirtualForPhysical(pa);
-    FreeEPTTable(pml4, EPT_TABLE_WALK_LENGTH);
+    FreeEPTTable((PEPTTableEntry)MmGetVirtualForPhysical(pa));
     eptp->pfn = 0;
   }
 
   ExFreePool(eptp);
   eptp = nullptr;
+}
+
+void FreeEPTTable(PEPTTableEntry table) {
+  FreeEPTTable(table, EPT_TABLE_WALK_LENGTH);
+  ExFreePool(table);
 }
 
 void FreeEPTTable(PEPTTableEntry table, size_t walk_length) {
@@ -91,17 +93,13 @@ void FreeEPTTable(PEPTTableEntry table, size_t walk_length) {
     ExFreePool(ptr);
     table[i].pfn = 0;
   }
-
-  ExFreePool(table);
 }
 
 void FreeRegion(PRegion region) {
-  if (!region->address) {
-    ExFreePool(region->address);
-    region->address = nullptr;
-    region->physical_address = 0;
-  }
-  return;
+  if (!region->address) return;
+  ExFreePool(region->address);
+  region->address = nullptr;
+  region->physical_address = 0;
 }
 
 void FreeVirtualMachines(void) {
@@ -110,11 +108,8 @@ void FreeVirtualMachines(void) {
 
   if (virtual_machines) {
     for (i = 0; i < MAX_CPU_COUNT; i++) {
-      if (virtual_machines[i].vmxon_region.address)
-        FreeRegion(&virtual_machines[i].vmxon_region);
-
-      if (virtual_machines[i].vmcs_region.address)
-        FreeRegion(&virtual_machines[i].vmcs_region);
+      FreeRegion(&virtual_machines[i].vmxon_region);
+      FreeRegion(&virtual_machines[i].vmcs_region);
     }
   }
 
@@ -123,7 +118,7 @@ void FreeVirtualMachines(void) {
 }
 
 UINT32 GetRevisionIdentifier(void) {
-  return __readmsr(IA32_VMX_BASIC_MSR) & 0x7FFFFFFF;
+  return __readmsr(IA32_VMX_BASIC_MSR) & REVISION_IDENTIFIER_MASK;
 }
 
 void InitializeMJFunctions(PDRIVER_OBJECT DriverObject) {
@@ -139,43 +134,35 @@ NTSTATUS InitializeDevices(PDRIVER_OBJECT DriverObject) {
   PDEVICE_OBJECT device_object = nullptr;
 
   RtlInitUnicodeString(&device_name, DEVICE_NAME);
+  GOTO_ERROR(!NT_SUCCESS(IoCreateDevice(DriverObject, 0, &device_name,
+                                        FILE_DEVICE_UNKNOWN, 0, false,
+                                        &device_object)),
+             "[-] Failed to create device object\n");
+
   RtlInitUnicodeString(&dos_device_name, DOS_DEVICE_NAME);
-
-  if (!NT_SUCCESS(IoCreateDevice(DriverObject, 0, &device_name,
-                                 FILE_DEVICE_UNKNOWN, 0, false,
-                                 &device_object))) {
-    DbgPrint("[-] Failed to create device object\n");
-    return STATUS_UNSUCCESSFUL;
-  }
-
-  if (!NT_SUCCESS(IoCreateSymbolicLink(&dos_device_name, &device_name))) {
-    DbgPrint("[-] Failed to create symbolic link\n");
-    return STATUS_UNSUCCESSFUL;
-  }
+  GOTO_ERROR(!NT_SUCCESS(IoCreateSymbolicLink(&dos_device_name, &device_name)),
+             "[-] Failed to create symbolic link\n");
 
   return STATUS_SUCCESS;
+
+error:
+  return STATUS_UNSUCCESSFUL;
 }
 
 bool InitializeVirtualMachines(void) {
+  size_t i = 0;
   UINT32 revision_identifier = 0;
   UINT8 status = 0;
-  size_t i = 0;
-  Region vmxon_region = {0};
-  Region vmcs_region = {0};
 
   if (virtual_machines) {
     DbgPrint("Virtual machines already initialized\n");
     return true;
   }
 
-  virtual_machines =
-      (PVM)ExAllocatePool(NonPagedPool, MAX_CPU_COUNT * sizeof(VM));
-  if (!virtual_machines) {
-    DbgPrint("[-] Failed to allocate memory for virtual machines\n");
-    return false;
-  }
-
   revision_identifier = GetRevisionIdentifier();
+
+  virtual_machines = NewVirtualMachines();
+  GOTO_ERROR(!virtual_machines, "[-] Failed to create virtual machines\n");
 
   for (i = 0; i < KeQueryActiveProcessorCount(nullptr); i++) {
     KeSetSystemAffinityThread((KAFFINITY)(1 << i));
@@ -183,41 +170,33 @@ bool InitializeVirtualMachines(void) {
     EnableVMXOperation();
     DbgPrint("[+] Enabled VMX operation on CPU %d\n", i);
 
-    InitializeRegion(&vmxon_region, revision_identifier);
-    if (!vmxon_region.address) {
-      DbgPrint("[-] Failed to create VMXON region\n");
-      return false;
-    }
-    DbgPrint("[+] VMXON region address %p, physical %p\n", vmxon_region.address,
-             vmxon_region.physical_address);
+    InitializeRegion(&virtual_machines[i].vmxon_region, revision_identifier);
+    GOTO_ERROR(!virtual_machines[i].vmxon_region.address,
+               "[-] Failed to create VMXON region\n");
+    DbgPrint("[+] VMXON region address %p, physical %p\n",
+             virtual_machines[i].vmxon_region.address,
+             virtual_machines[i].vmxon_region.physical_address);
 
-    status = __vmx_on(&vmxon_region.physical_address);
-    if (status) {
-      DbgPrint("[-] VMXON failed, status %d, CPU %d\n", status, i);
-      return false;
-    }
+    status = __vmx_on(&virtual_machines[i].vmxon_region.physical_address);
+    GOTO_ERROR(status, "[-] VMXON failed, status %d, CPU %d\n", status, i);
     DbgPrint("[+] VMXON succeeded on CPU %d\n", i);
 
-    InitializeRegion(&vmcs_region, revision_identifier);
-    if (!vmcs_region.address) {
-      DbgPrint("[-] Failed to create VMCS region\n");
-      return false;
-    }
-    DbgPrint("[+] VMCS region address %p, physical %p\n", vmcs_region.address,
-             vmcs_region.physical_address);
+    InitializeRegion(&virtual_machines[i].vmcs_region, revision_identifier);
+    GOTO_ERROR(!virtual_machines[i].vmcs_region.address,
+               "[-] Failed to create VMCS region\n");
+    DbgPrint("[+] VMCS region address %p, physical %p\n",
+             virtual_machines[i].vmcs_region.address,
+             virtual_machines[i].vmcs_region.physical_address);
 
-    status = __vmx_vmptrld(&vmcs_region.physical_address);
-    if (status) {
-      DbgPrint("[-] VMPTRLD failed, status %d, CPU %d\n", status, i);
-      return false;
-    }
+    status = __vmx_vmptrld(&virtual_machines[i].vmcs_region.physical_address);
+    GOTO_ERROR(status, "[-] VMPTRLD failed, status %d, CPU %d\n", status, i);
     DbgPrint("[+] VMPTRLD succeeded on CPU %d\n", i);
-
-    virtual_machines[i].vmxon_region = vmcs_region;
-    virtual_machines[i].vmcs_region = vmcs_region;
   }
 
   return true;
+
+error:
+  return false;
 }
 
 bool IsAlignedTo4KB(uintptr_t ptr) { return (ptr & 0xfff) == 0; }
@@ -234,9 +213,9 @@ bool InitializeEPTP(size_t initial_n_pages) {
   PEPTTableEntry pdpt = nullptr;
   PEPTTableEntry pd = nullptr;
   PEPTTableEntry pt = nullptr;
+  void* page = nullptr;
 
   size_t i = 0;
-  void* page = nullptr;
   PHYSICAL_ADDRESS pa = {0};
 
   if (eptp) {
@@ -245,17 +224,11 @@ bool InitializeEPTP(size_t initial_n_pages) {
   }
 
   eptp = (PEPTP)ExAllocatePool(NonPagedPool, sizeof(EPTP));
-  if (!eptp) {
-    DbgPrint("[-] Failed to create EPTP\n");
-    goto error;
-  }
+  GOTO_ERROR(!eptp, "[-] Failed to allocate EPTP\n");
   DbgPrint("[+] Successfully allocated EPTP %p\n", eptp);
 
   pml4 = NewEPTTable();
-  if (!pml4) {
-    DbgPrint("[-] Failed to create EPT PML4\n");
-    goto error;
-  }
+  GOTO_ERROR(!pml4, "[-] Failed to create EPT PML4\n");
   DbgPrint("[+] Successfully allocated EPT PML4 %p\n", pml4);
 
   eptp->enable_dirty_and_accessed = true;
@@ -264,10 +237,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   eptp->pfn = TO_PFN(MmGetPhysicalAddress(pml4).QuadPart);
 
   pdpt = NewEPTTable();
-  if (!pdpt) {
-    DbgPrint("[-] Failed to create EPT PDPT\n");
-    goto error;
-  }
+  GOTO_ERROR(!pdpt, "[-] Failed to create EPT PDPT\n");
   DbgPrint("[+] Successfully allocated EPT PDPT %p\n", pdpt);
 
   pml4[0].read = true;
@@ -276,10 +246,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   pml4[0].pfn = TO_PFN(MmGetPhysicalAddress(pdpt).QuadPart);
 
   pd = NewEPTTable();
-  if (!pd) {
-    DbgPrint("[-] Failed to create EPT PD\n");
-    goto error;
-  }
+  GOTO_ERROR(!pd, "[-] Failed to create EPT PD\n");
   DbgPrint("[+] Successfully allocated EPT PD %p\n", pd);
 
   pdpt[0].read = true;
@@ -288,10 +255,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   pdpt[0].pfn = TO_PFN(MmGetPhysicalAddress(pd).QuadPart);
 
   pt = NewEPTTable();
-  if (!pt) {
-    DbgPrint("[-] Failed to create EPT PT\n");
-    goto error;
-  }
+  GOTO_ERROR(!pt, "[-] Failed to create EPT PT\n");
   DbgPrint("[+] Successfully allocated EPT PT %p\n", pt);
 
   pd[0].read = true;
@@ -301,11 +265,8 @@ bool InitializeEPTP(size_t initial_n_pages) {
 
   for (i = 0; i < initial_n_pages; i++) {
     page = ExAllocatePool(NonPagedPool, SIZE);
-    if (!page) {
-      DbgPrint("[-] Failed to allocate PT %d page\n", i);
-      goto error;
-    }
-    DbgPrint("[+] Successfully allocated PTE %d page %p\n", i, page);
+    GOTO_ERROR(!page, "[-] Failed to allocate EPT PTE %d page\n", i);
+    DbgPrint("[+] Successfully allocated EPT PTE %d page %p\n", i, page);
 
     pt[i].read = true;
     pt[i].write = true;
@@ -323,16 +284,11 @@ error:
 
 bool InitializeRegion(PRegion region, UINT32 revision_identifier) {
   region->address = ExAllocatePool(NonPagedPool, SIZE);
-  if (!region->address) {
-    DbgPrint("[-] Failed to allocate memory for region\n");
-    goto error;
-  }
+  GOTO_ERROR(!region->address, "[-] Failed to allocate memory for region\n");
 
   region->physical_address = MmGetPhysicalAddress(region->address).QuadPart;
-  if (!IsAlignedTo4KB(region->physical_address)) {
-    DbgPrint("[-] Region is not physically aligned to 4KB\n");
-    goto error;
-  }
+  GOTO_ERROR(!IsAlignedTo4KB(region->physical_address),
+             "[-] Region is not physically aligned to 4KB\n");
 
   RtlSecureZeroMemory(region->address, SIZE);
   *(UINT32*)region->address = revision_identifier;
@@ -340,31 +296,38 @@ bool InitializeRegion(PRegion region, UINT32 revision_identifier) {
   return true;
 
 error:
-  FreeRegion(region);
+  if (region) FreeRegion(region);
   return false;
 }
 
 PEPTP NewEPTP(void) {
-  PEPTP eptp = nullptr;
-
-  eptp = (PEPTP)ExAllocatePool(NonPagedPool, sizeof(EPTP));
-  if (!eptp) {
-    DbgPrint("[-] Failed to allocate EPTP\n");
-    return nullptr;
-  }
+  PEPTP eptp = (PEPTP)ExAllocatePool(NonPagedPool, sizeof(EPTP));
+  GOTO_ERROR(!eptp, "[-] Failed to allocate EPTP\n");
   RtlSecureZeroMemory(eptp, sizeof(EPTP));
   return eptp;
+
+error:
+  return nullptr;
 }
 
 PEPTTableEntry NewEPTTable(void) {
-  PEPTTableEntry table = nullptr;
-
-  table = (PEPTTableEntry)ExAllocatePool(NonPagedPool,
-                                         sizeof(EPTTableEntry) * EPT_N_ENTRIES);
-  if (!table) {
-    DbgPrint("[-] Failed to allocate EPT GEN\n");
-    return nullptr;
-  }
+  PEPTTableEntry table = (PEPTTableEntry)ExAllocatePool(
+      NonPagedPool, sizeof(EPTTableEntry) * EPT_N_ENTRIES);
+  GOTO_ERROR(!table, "[-] Failed to allocate EPT table\n");
   RtlSecureZeroMemory(table, sizeof(EPTTableEntry) * EPT_N_ENTRIES);
   return table;
+
+error:
+  return nullptr;
+}
+
+PVM NewVirtualMachines(void) {
+  PVM virtual_machines =
+      (PVM)ExAllocatePool(NonPagedPool, MAX_CPU_COUNT * sizeof(VM));
+  GOTO_ERROR(!virtual_machines, "[-] Failed to allocate virtual machines\n");
+  RtlSecureZeroMemory(virtual_machines, MAX_CPU_COUNT * sizeof(VM));
+  return virtual_machines;
+
+error:
+  return nullptr;
 }

@@ -5,8 +5,11 @@
 
 #define DEVICE_NAME (L"\\Device\\my_hypervisor")
 #define DOS_DEVICE_NAME (L"\\DosDevices\\my_hypervisor")
+
 #define SIZE 0x1000
 #define IA32_VMX_BASIC_MSR 0x480
+#define REVISION_IDENTIFIER_MASK 0x7FFFFFFF
+
 #define MAX_CPU_COUNT 64
 #define EPT_N_ENTRIES 512
 #define EPT_TABLE_WALK_LENGTH 3
@@ -56,6 +59,7 @@ PEPTP eptp = nullptr;
 extern "C" void DriverUnload(PDRIVER_OBJECT DriverObject);
 extern "C" void EnableVMXOperation(void);
 void FreeEPTP(void);
+void FreeEPTTable(PEPTTableEntry table);
 void FreeEPTTable(PEPTTableEntry table, size_t walk_length);
 void FreeRegion(PRegion region);
 void FreeVirtualMachines(void);
@@ -69,5 +73,6 @@ bool IsAlignedTo4KB(uintptr_t ptr);
 NTSTATUS MJDoNothing(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 PEPTP NewEPTP(void);
 PEPTTableEntry NewEPTTable(void);
+PVM NewVirtualMachines(void);
 
 #endif  // !MAIN_H
