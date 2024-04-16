@@ -3,6 +3,9 @@
 #include <intrin.h>
 #include <ntddk.h>
 
+#include "../includes/magic.h"
+#include "../includes/vmcs.h"
+
 #define TO_PFN(address) ((address) >> 12)
 #define FROM_PFN(pfn) ((pfn) << 12)
 #define GOTO_ERROR(cond, msg, ...) \
@@ -26,6 +29,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject,
              "[-] Failed to initialize EPT tables\n");
 
   DbgPrint("[+] Driver finished initializing\n");
+
   return STATUS_SUCCESS;
 
 error:
@@ -44,7 +48,6 @@ extern "C" void DriverUnload(PDRIVER_OBJECT DriverObject) {
   for (i = 0; i < KeQueryActiveProcessorCount(nullptr); i++) {
     KeSetSystemAffinityThread((KAFFINITY)(1 << i));
     __vmx_off();
-    DbgPrint("[+] VMXOFF succeeded on CPU %d\n", i);
   }
 
   FreeVirtualMachines();
@@ -128,6 +131,12 @@ void InitializeMJFunctions(PDRIVER_OBJECT DriverObject) {
   }
 }
 
+SegmentDescriptor GetSegmentDescriptor(UINT64 segment_selector) {
+  GDTR gdtr = {0};
+  GetGDTR(&gdtr);
+  return ((SegmentDescriptor*)gdtr.base)[segment_selector & ~7ui64];
+}
+
 NTSTATUS InitializeDevices(PDRIVER_OBJECT DriverObject) {
   UNICODE_STRING device_name = {0};
   UNICODE_STRING dos_device_name = {0};
@@ -149,6 +158,48 @@ error:
   return STATUS_UNSUCCESSFUL;
 }
 
+bool InitializeVirtualMachine(PVM virtual_machine, size_t cpu_index,
+                              size_t revision_identifier) {
+  UINT8 status = 0;
+
+  KeSetSystemAffinityThread((KAFFINITY)(1 << cpu_index));
+
+  EnableVMXOperation();
+  DbgPrint("[+] Enabled VMX operation on CPU %d\n", cpu_index);
+
+  GOTO_ERROR(
+      !InitializeRegion(&virtual_machine->vmxon_region, revision_identifier),
+      "[-] Failed to initialize VMXON region\n");
+  DbgPrint("[+] VMXON region address %p, physical %p\n",
+           virtual_machine->vmxon_region.address,
+           virtual_machine->vmxon_region.physical_address);
+
+  status = __vmx_on(&virtual_machine->vmxon_region.physical_address);
+  GOTO_ERROR(status, "[-] VMXON failed, status %d, CPU %d\n", status,
+             cpu_index);
+  DbgPrint("[+] VMXON succeeded on CPU %d\n", cpu_index);
+
+  GOTO_ERROR(
+      !InitializeRegion(&virtual_machine->vmcs_region, revision_identifier),
+      "[-] Failed to initialize VMCS region\n");
+  DbgPrint("[+] VMCS region address %p, physical %p\n",
+           virtual_machine->vmcs_region.address,
+           virtual_machine->vmcs_region.physical_address);
+
+  status = __vmx_vmptrld(&virtual_machine->vmcs_region.physical_address);
+  GOTO_ERROR(status, "[-] VMPTRLD failed, status %d, CPU %d\n", status,
+             cpu_index);
+  DbgPrint("[+] VMPTRLD succeeded on CPU %d\n", cpu_index);
+
+  return true;
+
+error:
+  __vmx_off();
+  FreeRegion(&virtual_machine->vmxon_region);
+  FreeRegion(&virtual_machine->vmcs_region);
+  return false;
+}
+
 bool InitializeVirtualMachines(void) {
   size_t i = 0;
   UINT32 revision_identifier = 0;
@@ -159,38 +210,14 @@ bool InitializeVirtualMachines(void) {
     return true;
   }
 
-  revision_identifier = GetRevisionIdentifier();
-
-  virtual_machines = NewVirtualMachines();
+  virtual_machines = AllocateVirtualMachines();
   GOTO_ERROR(!virtual_machines, "[-] Failed to create virtual machines\n");
 
+  revision_identifier = GetRevisionIdentifier();
   for (i = 0; i < KeQueryActiveProcessorCount(nullptr); i++) {
-    KeSetSystemAffinityThread((KAFFINITY)(1 << i));
-
-    EnableVMXOperation();
-    DbgPrint("[+] Enabled VMX operation on CPU %d\n", i);
-
-    InitializeRegion(&virtual_machines[i].vmxon_region, revision_identifier);
-    GOTO_ERROR(!virtual_machines[i].vmxon_region.address,
-               "[-] Failed to create VMXON region\n");
-    DbgPrint("[+] VMXON region address %p, physical %p\n",
-             virtual_machines[i].vmxon_region.address,
-             virtual_machines[i].vmxon_region.physical_address);
-
-    status = __vmx_on(&virtual_machines[i].vmxon_region.physical_address);
-    GOTO_ERROR(status, "[-] VMXON failed, status %d, CPU %d\n", status, i);
-    DbgPrint("[+] VMXON succeeded on CPU %d\n", i);
-
-    InitializeRegion(&virtual_machines[i].vmcs_region, revision_identifier);
-    GOTO_ERROR(!virtual_machines[i].vmcs_region.address,
-               "[-] Failed to create VMCS region\n");
-    DbgPrint("[+] VMCS region address %p, physical %p\n",
-             virtual_machines[i].vmcs_region.address,
-             virtual_machines[i].vmcs_region.physical_address);
-
-    status = __vmx_vmptrld(&virtual_machines[i].vmcs_region.physical_address);
-    GOTO_ERROR(status, "[-] VMPTRLD failed, status %d, CPU %d\n", status, i);
-    DbgPrint("[+] VMPTRLD succeeded on CPU %d\n", i);
+    GOTO_ERROR(
+        !InitializeVirtualMachine(&virtual_machines[i], i, revision_identifier),
+        "[-] Failed to initialize virtual machine on CPU %d\n", i);
   }
 
   return true;
@@ -227,7 +254,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   GOTO_ERROR(!eptp, "[-] Failed to allocate EPTP\n");
   DbgPrint("[+] Successfully allocated EPTP %p\n", eptp);
 
-  pml4 = NewEPTTable();
+  pml4 = AllocateEPTTable();
   GOTO_ERROR(!pml4, "[-] Failed to create EPT PML4\n");
   DbgPrint("[+] Successfully allocated EPT PML4 %p\n", pml4);
 
@@ -236,7 +263,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   eptp->page_walk_length = EPT_TABLE_WALK_LENGTH;
   eptp->pfn = TO_PFN(MmGetPhysicalAddress(pml4).QuadPart);
 
-  pdpt = NewEPTTable();
+  pdpt = AllocateEPTTable();
   GOTO_ERROR(!pdpt, "[-] Failed to create EPT PDPT\n");
   DbgPrint("[+] Successfully allocated EPT PDPT %p\n", pdpt);
 
@@ -245,7 +272,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   pml4[0].execute = true;
   pml4[0].pfn = TO_PFN(MmGetPhysicalAddress(pdpt).QuadPart);
 
-  pd = NewEPTTable();
+  pd = AllocateEPTTable();
   GOTO_ERROR(!pd, "[-] Failed to create EPT PD\n");
   DbgPrint("[+] Successfully allocated EPT PD %p\n", pd);
 
@@ -254,7 +281,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   pdpt[0].execute = true;
   pdpt[0].pfn = TO_PFN(MmGetPhysicalAddress(pd).QuadPart);
 
-  pt = NewEPTTable();
+  pt = AllocateEPTTable();
   GOTO_ERROR(!pt, "[-] Failed to create EPT PT\n");
   DbgPrint("[+] Successfully allocated EPT PT %p\n", pt);
 
@@ -278,7 +305,7 @@ bool InitializeEPTP(size_t initial_n_pages) {
   return true;
 
 error:
-  if (eptp) FreeEPTP();
+  FreeEPTP();
   return false;
 }
 
@@ -296,11 +323,11 @@ bool InitializeRegion(PRegion region, UINT32 revision_identifier) {
   return true;
 
 error:
-  if (region) FreeRegion(region);
+  FreeRegion(region);
   return false;
 }
 
-PEPTP NewEPTP(void) {
+PEPTP AllocateEPTP(void) {
   PEPTP eptp = (PEPTP)ExAllocatePool(NonPagedPool, sizeof(EPTP));
   GOTO_ERROR(!eptp, "[-] Failed to allocate EPTP\n");
   RtlSecureZeroMemory(eptp, sizeof(EPTP));
@@ -310,7 +337,7 @@ error:
   return nullptr;
 }
 
-PEPTTableEntry NewEPTTable(void) {
+PEPTTableEntry AllocateEPTTable(void) {
   PEPTTableEntry table = (PEPTTableEntry)ExAllocatePool(
       NonPagedPool, sizeof(EPTTableEntry) * EPT_N_ENTRIES);
   GOTO_ERROR(!table, "[-] Failed to allocate EPT table\n");
@@ -321,7 +348,7 @@ error:
   return nullptr;
 }
 
-PVM NewVirtualMachines(void) {
+PVM AllocateVirtualMachines(void) {
   PVM virtual_machines =
       (PVM)ExAllocatePool(NonPagedPool, MAX_CPU_COUNT * sizeof(VM));
   GOTO_ERROR(!virtual_machines, "[-] Failed to allocate virtual machines\n");
@@ -330,4 +357,18 @@ PVM NewVirtualMachines(void) {
 
 error:
   return nullptr;
+}
+
+void InitializeCurrentVMCS(void) {
+  __vmx_vmwrite(VMCS_HOST_CS_SELECTOR, GetCS() & ~7ui64);
+  __vmx_vmwrite(VMCS_HOST_DS_SELECTOR, GetDS() & ~7ui64);
+  __vmx_vmwrite(VMCS_HOST_ES_SELECTOR, GetES() & ~7ui64);
+  __vmx_vmwrite(VMCS_HOST_FS_SELECTOR, GetFS() & ~7ui64);
+  __vmx_vmwrite(VMCS_HOST_GS_SELECTOR, GetGS() & ~7ui64);
+  __vmx_vmwrite(VMCS_HOST_SS_SELECTOR, GetSS() & ~7ui64);
+  __vmx_vmwrite(VMCS_HOST_TR_SELECTOR, GetTR() & ~7ui64);
+
+  __vmx_vmwrite(VMCS_LINK_POINTER, VMCS_INITIAL);
+
+  __vmx_vmwrite(VMCS_GUEST_IA32_DEBUGCTL, __readmsr(IA32_DEBUGCTL_MSR));
 }
