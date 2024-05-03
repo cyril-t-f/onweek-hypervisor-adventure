@@ -9,8 +9,14 @@ PUBLIC GetIDTR
 PUBLIC GetLDTR
 PUBLIC GetRflags
 PUBLIC GetSS
+PUBLIC SaveRSPRBP
+PUBLIC RestoreRSPRBP
 
 .code
+
+EXTERN saved_rip:QWORD
+EXTERN saved_rbp:QWORD;
+EXTERN saved_rsp:QWORD;
 
 EnableVMXOperation PROC PUBLIC
     xor rax, rax
@@ -51,13 +57,13 @@ GetGS PROC PUBLIC
 GetGS ENDP
 
 GetIDTR PROC PUBLIC
-    SIDT [RCX]
-    RET
+    sidt [rcx]
+    ret
 GetIDTR ENDP
 
 GetLDTR PROC PUBLIC
-    SLDT RAX
-    RET
+    sldt rax
+    ret
 GetLDTR  ENDP
 
 GetRflags PROC PUBLIC
@@ -72,8 +78,22 @@ GetSS PROC PUBLIC
 GetSS  ENDP
 
 GetTR PROC PUBLIC
-    STR RAX
-    RET
+    str rax
+    ret
 GetTR  ENDP
+
+SaveState PROC PUBLIC
+    mov saved_rsp, rsp
+    mov saved_rbp, rbp
+    mov saved_rip, [rsp]
+    ret
+SaveState ENDP
+
+RestoreState PROC PUBLIC
+    mov rsp, saved_rsp
+    mov rbp, saved_rbp
+    mov [rsp], saved_rip
+    ret
+RestoreState ENDP
 
 END
